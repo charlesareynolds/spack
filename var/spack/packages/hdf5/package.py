@@ -11,6 +11,8 @@ class Hdf5(Package):
     list_url = "http://www.hdfgroup.org/ftp/HDF5/releases"
     list_depth = 3
     
+    version('1.8.15-patch1',
+                      '4467c25ed9c0b126b194a4d9d66c29ac')
     version('1.8.15', '03cccb5b33dbe975fdcd8ae9dc021f24')
     version('1.8.13', 'c03426e9e77d7766944654280b467289')
 

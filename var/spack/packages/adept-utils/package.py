@@ -33,10 +33,15 @@ class AdeptUtils(Package):
     version('1.0.1', '731a310717adcb004d9d195130efee7d')
     version('1.0',   '5c6cd9badce56c945ac8551e34804397')
 
-    depends_on("boost")
+    depends_on("boost@1.42:")
     depends_on("mpi")
 
     def install(self, spec, prefix):
-        cmake(*std_cmake_args)
+        cmake('.',
+              '-DBoost_INCLUDE_DIR=%s' % spec['boost'].prefix.include,
+              '-DBoost_LIBRARY_DIR=%s' % spec['boost'].prefix.lib,
+              '-DBoost_NO_SYSTEM_PATHS=TRUE',
+              *std_cmake_args
+              )
         make()
         make("install")

@@ -1,10 +1,13 @@
-/var/spack/stage
-*.pyc
-/opt/
 *~
+*.pyc
+# USER SPECIFIC:
+# (commented out so that I can retain execution configurations in CM):
+# .idea/workspace.xml
 .DS_Store
-.idea
 /etc/spack/*
 /etc/spackconfig
+/opt/
 /share/spack/dotkit
 /share/spack/modules
+/var/spack/stage
+

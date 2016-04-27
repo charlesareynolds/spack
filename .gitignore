@@ -1,3 +1,6 @@
+/var/spack/stage
+*.pyc
+/opt/
 *~
 *.pyc
 # USER SPECIFIC:
@@ -6,8 +9,6 @@
 .DS_Store
 /etc/spack/*
 /etc/spackconfig
-/opt/
 /share/spack/dotkit
 /share/spack/modules
-/var/spack/stage
-
+/TAGS

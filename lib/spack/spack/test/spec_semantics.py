@@ -6,7 +6,7 @@
 # Written by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://scalability-llnl.github.io/spack
+# For details, see https://github.com/llnl/spack
 # Please also see the LICENSE file for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
@@ -22,7 +22,6 @@
 # along with this program; if not, write to the Free Software Foundation,
 # Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 ##############################################################################
-import unittest
 from spack.spec import *
 from spack.test.mock_packages_test import *
 
@@ -35,7 +34,10 @@ class SpecSematicsTest(MockPackagesTest):
     # ================================================================================
     def check_satisfies(self, spec, anon_spec, concrete=False):
         left = Spec(spec, concrete=concrete)
-        right = parse_anonymous_spec(anon_spec, left.name)
+        try:
+            right = Spec(anon_spec)  # if it's not anonymous, allow it.
+        except:
+            right = parse_anonymous_spec(anon_spec, left.name)
 
         # Satisfies is one-directional.
         self.assertTrue(left.satisfies(right))
@@ -48,7 +50,10 @@ class SpecSematicsTest(MockPackagesTest):
 
     def check_unsatisfiable(self, spec, anon_spec, concrete=False):
         left = Spec(spec, concrete=concrete)
-        right = parse_anonymous_spec(anon_spec, left.name)
+        try:
+            right = Spec(anon_spec)  # if it's not anonymous, allow it.
+        except:
+            right = parse_anonymous_spec(anon_spec, left.name)
 
         self.assertFalse(left.satisfies(right))
         self.assertFalse(left.satisfies(anon_spec))
@@ -86,6 +91,28 @@ class SpecSematicsTest(MockPackagesTest):
     def test_satisfies(self):
         self.check_satisfies('libelf@0.8.13', '@0:1')
         self.check_satisfies('libdwarf^libelf@0.8.13', '^libelf@0:1')
+
+
+    def test_satisfies_namespace(self):
+        self.check_satisfies('builtin.mpich', 'mpich')
+        self.check_satisfies('builtin.mock.mpich', 'mpich')
+
+        # TODO: only works for deps now, but shouldn't we allow this for root spec?
+        # self.check_satisfies('builtin.mock.mpich', 'mpi')
+
+        self.check_satisfies('builtin.mock.mpich', 'builtin.mock.mpich')
+
+        self.check_unsatisfiable('builtin.mock.mpich', 'builtin.mpich')
+
+
+    def test_satisfies_namespaced_dep(self):
+        """Ensure spec from same or unspecified namespace satisfies namespace constraint."""
+        self.check_satisfies('mpileaks ^builtin.mock.mpich', '^mpich')
+
+        self.check_satisfies('mpileaks ^builtin.mock.mpich', '^mpi')
+        self.check_satisfies('mpileaks ^builtin.mock.mpich', '^builtin.mock.mpich')
+
+        self.check_unsatisfiable('mpileaks ^builtin.mock.mpich', '^builtin.mpich')
 
 
     def test_satisfies_compiler(self):
@@ -190,9 +217,21 @@ class SpecSematicsTest(MockPackagesTest):
 
 
     def test_satisfies_virtual(self):
+        # Don't use check_satisfies: it checks constrain() too, and
+        # you can't constrain a non-virtual by a virtual.
         self.assertTrue(Spec('mpich').satisfies(Spec('mpi')))
         self.assertTrue(Spec('mpich2').satisfies(Spec('mpi')))
         self.assertTrue(Spec('zmpi').satisfies(Spec('mpi')))
+
+
+    def test_satisfies_virtual_dep_with_virtual_constraint(self):
+        """Ensure we can satisfy virtual constraints when there are multiple
+           vdep providers in the specs."""
+        self.assertTrue(Spec('netlib-lapack ^openblas').satisfies('netlib-lapack ^openblas'))
+        self.assertFalse(Spec('netlib-lapack ^netlib-blas').satisfies('netlib-lapack ^openblas'))
+
+        self.assertFalse(Spec('netlib-lapack ^openblas').satisfies('netlib-lapack ^netlib-blas'))
+        self.assertTrue(Spec('netlib-lapack ^netlib-blas').satisfies('netlib-lapack ^netlib-blas'))
 
 
     # ================================================================================
@@ -327,4 +366,3 @@ class SpecSematicsTest(MockPackagesTest):
         self.check_constrain_not_changed('libelf^foo+debug', 'libelf^foo+debug')
         self.check_constrain_not_changed('libelf^foo~debug', 'libelf^foo~debug')
         self.check_constrain_not_changed('libelf^foo=bgqos_0', 'libelf^foo=bgqos_0')
-

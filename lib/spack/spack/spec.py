@@ -6,7 +6,7 @@
 # Written by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://scalability-llnl.github.io/spack
+# For details, see https://github.com/llnl/spack
 # Please also see the LICENSE file for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
@@ -96,8 +96,8 @@ import hashlib
 import base64
 from StringIO import StringIO
 from operator import attrgetter
-from external import yaml
-from external.yaml.error import MarkedYAMLError
+import yaml
+from yaml.error import MarkedYAMLError
 
 import llnl.util.tty as tty
 from llnl.util.lang import *
@@ -353,7 +353,7 @@ class VariantMap(HashableMap):
     @property
     def concrete(self):
         return self.spec._concrete or all(
-            v in self for v in self.spec.package.variants)
+            v in self for v in self.spec.package_class.variants)
 
 
     def copy(self):
@@ -412,13 +412,17 @@ class Spec(object):
         self.dependencies = other.dependencies
         self.variants = other.variants
         self.variants.spec = self
+        self.namespace = other.namespace
 
         # Specs are by default not assumed to be normal, but in some
         # cases we've read them from a file want to assume normal.
         # This allows us to manipulate specs that Spack doesn't have
         # package.py files for.
-        self._normal = kwargs.get('normal', False)
+        self._normal   = kwargs.get('normal', False)
         self._concrete = kwargs.get('concrete', False)
+
+        # Allow a spec to be constructed with an external path.
+        self.external  = kwargs.get('external', None)
 
         # This allows users to construct a spec DAG with literals.
         # Note that given two specs a and b, Spec(a) copies a, but
@@ -464,6 +468,13 @@ class Spec(object):
         self.dependencies[spec.name] = spec
         spec.dependents[self.name] = self
 
+    #
+    # Public interface
+    #
+    @property
+    def fullname(self):
+        return '%s.%s' % (self.namespace, self.name) if self.namespace else self.name
+
 
     @property
     def root(self):
@@ -486,7 +497,15 @@ class Spec(object):
 
     @property
     def package(self):
-        return spack.db.get(self)
+        return spack.repo.get(self)
+
+
+    @property
+    def package_class(self):
+        """Internal package call gets only the class object for a package.
+           Use this to just get package metadata.
+        """
+        return spack.repo.get_pkg_class(self.name)
 
 
     @property
@@ -504,7 +523,7 @@ class Spec(object):
     @staticmethod
     def is_virtual(name):
         """Test if a name is virtual without requiring a Spec."""
-        return not spack.db.exists(name)
+        return not spack.repo.exists(name)
 
 
     @property
@@ -517,11 +536,13 @@ class Spec(object):
             return True
 
         self._concrete = bool(not self.virtual
+                              and self.namespace is not None
                               and self.versions.concrete
                               and self.variants.concrete
                               and self.architecture
                               and self.compiler and self.compiler.concrete
                               and self.dependencies.concrete)
+
         return self._concrete
 
 
@@ -657,6 +678,12 @@ class Spec(object):
             'dependencies' : dict((d, self.dependencies[d].dag_hash())
                                   for d in sorted(self.dependencies))
         }
+
+        # Older concrete specs do not have a namespace.  Omit for
+        # consistent hashing.
+        if not self.concrete or self.namespace:
+            d['namespace'] = self.namespace
+
         if self.compiler:
             d.update(self.compiler.to_dict())
         else:
@@ -681,6 +708,7 @@ class Spec(object):
         node = node[name]
 
         spec = Spec(name)
+        spec.namespace = node.get('namespace', None)
         spec.versions = VersionList.from_dict(node)
         spec.architecture = node['arch']
 
@@ -753,12 +781,11 @@ class Spec(object):
             # Concretize virtual dependencies last.  Because they're added
             # to presets below, their constraints will all be merged, but we'll
             # still need to select a concrete package later.
-            if not self.virtual:
-                changed |= any(
-                    (spack.concretizer.concretize_architecture(self),
-                     spack.concretizer.concretize_compiler(self),
-                     spack.concretizer.concretize_version(self),
-                     spack.concretizer.concretize_variants(self)))
+            changed |= any(
+                (spack.concretizer.concretize_architecture(self),
+                 spack.concretizer.concretize_compiler(self),
+                 spack.concretizer.concretize_version(self),
+                 spack.concretizer.concretize_variants(self)))
             presets[self.name] = self
 
         visited.add(self.name)
@@ -769,8 +796,30 @@ class Spec(object):
         """Replace this virtual spec with a concrete spec."""
         assert(self.virtual)
         for name, dependent in self.dependents.items():
+            # remove self from all dependents.
             del dependent.dependencies[self.name]
-            dependent._add_dependency(concrete)
+
+            # add the replacement, unless it is already a dep of dependent.
+            if concrete.name not in dependent.dependencies:
+                dependent._add_dependency(concrete)
+
+
+    def _replace_node(self, replacement):
+        """Replace this spec with another.
+
+        Connects all dependents of this spec to its replacement, and
+        disconnects this spec from any dependencies it has. New spec
+        will have any dependencies the replacement had, and may need
+        to be normalized.
+
+        """
+        for name, dependent in self.dependents.items():
+            del dependent.dependencies[self.name]
+            dependent._add_dependency(replacement)
+
+        for name, dep in self.dependencies.items():
+            del dep.dependents[self.name]
+            del self.dependencies[dep.name]
 
 
     def _expand_virtual_packages(self):
@@ -790,22 +839,81 @@ class Spec(object):
               this are infrequent, but should implement this before it is
               a problem.
         """
+        # Make an index of stuff this spec already provides
+        self_index = ProviderIndex(self.traverse(), restrict=True)
+
         changed = False
-        while True:
-            virtuals =[v for v in self.traverse() if v.virtual]
-            if not virtuals:
-                return changed
+        done = False
+        while not done:
+            done = True
+            for spec in list(self.traverse()):
+                replacement = None
+                if spec.virtual:
+                    replacement = self._find_provider(spec, self_index)
+                    if replacement:
+                        # TODO: may break if in-place on self but
+                        # shouldn't happen if root is traversed first.
+                        spec._replace_with(replacement)
+                        done=False
+                        break
 
-            for spec in virtuals:
-                providers = spack.db.providers_for(spec)
-                concrete = spack.concretizer.choose_provider(spec, providers)
-                concrete = concrete.copy()
-                spec._replace_with(concrete)
-                changed = True
+                if not replacement:
+                    # Get a list of possible replacements in order of preference.
+                    candidates = spack.concretizer.choose_virtual_or_external(spec)
 
-            # If there are duplicate providers or duplicate provider deps, this
-            # consolidates them and merge constraints.
-            changed |= self.normalize(force=True)
+                    # Try the replacements in order, skipping any that cause
+                    # satisfiability problems.
+                    for replacement in candidates:
+                        if replacement is spec:
+                            break
+
+                        # Replace spec with the candidate and normalize
+                        copy = self.copy()
+                        copy[spec.name]._dup(replacement.copy(deps=False))
+
+                        try:
+                            # If there are duplicate providers or duplicate provider
+                            # deps, consolidate them and merge constraints.
+                            copy.normalize(force=True)
+                            break
+                        except SpecError as e:
+                            # On error, we'll try the next replacement.
+                            continue
+
+                # If replacement is external then trim the dependencies
+                if replacement.external:
+                    if (spec.dependencies):
+                        changed = True
+                        spec.dependencies = DependencyMap()
+                    replacement.dependencies = DependencyMap()
+
+                # TODO: could this and the stuff in _dup be cleaned up?
+                def feq(cfield, sfield):
+                    return (not cfield) or (cfield == sfield)
+
+                if replacement is spec or (feq(replacement.name, spec.name) and
+                    feq(replacement.versions, spec.versions) and
+                    feq(replacement.compiler, spec.compiler) and
+                    feq(replacement.architecture, spec.architecture) and
+                    feq(replacement.dependencies, spec.dependencies) and
+                    feq(replacement.variants, spec.variants) and
+                    feq(replacement.external, spec.external)):
+                    continue
+
+                # Refine this spec to the candidate. This uses
+                # replace_with AND dup so that it can work in
+                # place. TODO: make this more efficient.
+                if spec.virtual:
+                    spec._replace_with(replacement)
+                    changed = True
+                if spec._dup(replacement, deps=False, cleardeps=False):
+                    changed = True
+
+                self_index.update(spec)
+                done=False
+                break
+
+        return changed
 
 
     def concretize(self):
@@ -820,6 +928,7 @@ class Spec(object):
            with requirements of its pacakges.  See flatten() and normalize() for
            more details on this.
         """
+
         if self._concrete:
             return
 
@@ -827,13 +936,37 @@ class Spec(object):
         force = False
 
         while changed:
-            changes = (self.normalize(force=force),
+            changes = (self.normalize(force),
                        self._expand_virtual_packages(),
                        self._concretize_helper())
             changed = any(changes)
             force=True
 
-        self._concrete = True
+        for s in self.traverse():
+            # After concretizing, assign namespaces to anything left.
+            # Note that this doesn't count as a "change".  The repository
+            # configuration is constant throughout a spack run, and
+            # normalize and concretize evaluate Packages using Repo.get(),
+            # which respects precedence.  So, a namespace assignment isn't
+            # changing how a package name would have been interpreted and
+            # we can do it as late as possible to allow as much
+            # compatibility across repositories as possible.
+            if s.namespace is None:
+                s.namespace = spack.repo.repo_for_pkg(s.name).namespace
+
+        # Mark everything in the spec as concrete, as well.
+        self._mark_concrete()
+
+
+    def _mark_concrete(self):
+        """Mark this spec and its dependencies as concrete.
+
+        Only for internal use -- client code should use "concretize"
+        unless there is a need to force a spec to be concrete.
+        """
+        for s in self.traverse():
+            s._normal = True
+            s._concrete = True
 
 
     def concretized(self):
@@ -908,7 +1041,7 @@ class Spec(object):
         the dependency.  If no conditions are True (and we don't
         depend on it), return None.
         """
-        pkg = spack.db.get(self.name)
+        pkg = spack.repo.get(self.fullname)
         conditions = pkg.dependencies[name]
 
         # evaluate when specs to figure out constraints on the dependency.
@@ -929,8 +1062,8 @@ class Spec(object):
 
     def _find_provider(self, vdep, provider_index):
         """Find provider for a virtual spec in the provider index.
-        Raise an exception if there is a conflicting virtual
-        dependency already in this spec.
+           Raise an exception if there is a conflicting virtual
+           dependency already in this spec.
         """
         assert(vdep.virtual)
         providers = provider_index.providers_for(vdep)
@@ -971,17 +1104,14 @@ class Spec(object):
         """
         changed = False
 
-        # If it's a virtual dependency, try to find a provider and
-        # merge that.
+        # If it's a virtual dependency, try to find an existing
+        # provider in the spec, and merge that.
         if dep.virtual:
             visited.add(dep.name)
             provider = self._find_provider(dep, provider_index)
             if provider:
                 dep = provider
-
         else:
-            # if it's a real dependency, check whether it provides
-            # something already required in the spec.
             index = ProviderIndex([dep], restrict=True)
             for vspec in (v for v in spec_deps.values() if v.virtual):
                 if index.providers_for(vspec):
@@ -1028,7 +1158,7 @@ class Spec(object):
 
         # if we descend into a virtual spec, there's nothing more
         # to normalize.  Concretize will finish resolving it later.
-        if self.virtual:
+        if self.virtual or self.external:
             return False
 
         # Combine constraints from package deps with constraints from
@@ -1036,7 +1166,7 @@ class Spec(object):
         any_change = False
         changed = True
 
-        pkg = spack.db.get(self.name)
+        pkg = spack.repo.get(self.fullname)
         while changed:
             changed = False
             for dep_name in pkg.dependencies:
@@ -1057,18 +1187,17 @@ class Spec(object):
            the root, and ONLY the ones that were explicitly provided are there.
            Normalization turns a partial flat spec into a DAG, where:
 
-           1. ALL dependencies of the root package are in the DAG.
-           2. Each node's dependencies dict only contains its direct deps.
+           1. Known dependencies of the root package are in the DAG.
+           2. Each node's dependencies dict only contains its known direct deps.
            3. There is only ONE unique spec for each package in the DAG.
 
               * This includes virtual packages.  If there a non-virtual
                 package that provides a virtual package that is in the spec,
                 then we replace the virtual package with the non-virtual one.
 
-           4. The spec DAG matches package DAG, including default variant values.
-
            TODO: normalize should probably implement some form of cycle detection,
            to ensure that the spec is actually a DAG.
+
         """
         if self._normal and not force:
             return False
@@ -1079,13 +1208,14 @@ class Spec(object):
         # Get all the dependencies into one DependencyMap
         spec_deps = self.flat_dependencies(copy=False)
 
-        # Initialize index of virtual dependency providers
-        index = ProviderIndex(spec_deps.values(), restrict=True)
+        # Initialize index of virtual dependency providers if
+        # concretize didn't pass us one already
+        provider_index = ProviderIndex(spec_deps.values(), restrict=True)
 
         # traverse the package DAG and fill out dependencies according
         # to package files & their 'when' specs
         visited = set()
-        any_change = self._normalize_helper(visited, spec_deps, index)
+        any_change = self._normalize_helper(visited, spec_deps, provider_index)
 
         # If there are deps specified but not visited, they're not
         # actually deps of this package.  Raise an error.
@@ -1114,7 +1244,7 @@ class Spec(object):
         for spec in self.traverse():
             # Don't get a package for a virtual name.
             if not spec.virtual:
-                spack.db.get(spec.name)
+                spack.repo.get(spec.fullname)
 
             # validate compiler in addition to the package name.
             if spec.compiler:
@@ -1123,7 +1253,7 @@ class Spec(object):
 
             # Ensure that variants all exist.
             for vname, variant in spec.variants.items():
-                if vname not in spec.package.variants:
+                if vname not in spec.package_class.variants:
                     raise UnknownVariantError(spec.name, vname)
 
 
@@ -1136,6 +1266,10 @@ class Spec(object):
 
         if not self.name == other.name:
             raise UnsatisfiableSpecNameError(self.name, other.name)
+
+        if other.namespace is not None:
+            if self.namespace is not None and other.namespace != self.namespace:
+                raise UnsatisfiableSpecNameError(self.fullname, other.fullname)
 
         if not self.versions.overlaps(other.versions):
             raise UnsatisfiableVersionSpecError(self.versions, other.versions)
@@ -1180,7 +1314,7 @@ class Spec(object):
 
         # TODO: might want more detail than this, e.g. specific deps
         # in violation. if this becomes a priority get rid of this
-        # check and be more specici about what's wrong.
+        # check and be more specific about what's wrong.
         if not other.satisfies_dependencies(self):
             raise UnsatisfiableDependencySpecError(other, self)
 
@@ -1205,6 +1339,13 @@ class Spec(object):
         common.intersection_update(
             s.name for s in other.traverse(root=False))
         return common
+
+
+    def constrained(self, other, deps=True):
+        """Return a constrained copy without modifying this spec."""
+        clone = self.copy(deps=deps)
+        clone.constrain(other, deps)
+        return clone
 
 
     def dep_difference(self, other):
@@ -1246,7 +1387,7 @@ class Spec(object):
 
         # A concrete provider can satisfy a virtual dependency.
         if not self.virtual and other.virtual:
-            pkg = spack.db.get(self.name)
+            pkg = spack.repo.get(self.fullname)
             if pkg.provides(other.name):
                 for provided, when_spec in pkg.provided.items():
                     if self.satisfies(when_spec, deps=False, strict=strict):
@@ -1257,6 +1398,11 @@ class Spec(object):
         # Otherwise, first thing we care about is whether the name matches
         if self.name != other.name:
             return False
+
+        # namespaces either match, or other doesn't require one.
+        if other.namespace is not None:
+            if self.namespace is not None and self.namespace != other.namespace:
+                return False
 
         if self.versions and other.versions:
             if not self.versions.satisfies(other.versions, strict=strict):
@@ -1348,15 +1494,26 @@ class Spec(object):
                Whether deps should be copied too.  Set to false to copy a
                spec but not its dependencies.
         """
+        # We don't count dependencies as changes here
+        changed = True
+        if hasattr(self, 'name'):
+            changed = (self.name != other.name and self.versions != other.versions and
+                       self.architecture != other.architecture and self.compiler != other.compiler and
+                       self.variants != other.variants and self._normal != other._normal and
+                       self.concrete != other.concrete and self.external != other.external)
+
         # Local node attributes get copied first.
         self.name = other.name
         self.versions = other.versions.copy()
         self.architecture = other.architecture
         self.compiler = other.compiler.copy() if other.compiler else None
-        self.dependents = DependencyMap()
-        self.dependencies = DependencyMap()
+        if kwargs.get('cleardeps', True):
+            self.dependents = DependencyMap()
+            self.dependencies = DependencyMap()
         self.variants = other.variants.copy()
         self.variants.spec = self
+        self.external = other.external
+        self.namespace = other.namespace
 
         # If we copy dependencies, preserve DAG structure in the new spec
         if kwargs.get('deps', True):
@@ -1374,6 +1531,8 @@ class Spec(object):
         # Since we preserved structure, we can copy _normal safely.
         self._normal = other._normal
         self._concrete = other._concrete
+        self.external = other.external
+        return changed
 
 
     def copy(self, **kwargs):
@@ -1474,8 +1633,12 @@ class Spec(object):
 
     def _cmp_node(self):
         """Comparison key for just *this node* and not its deps."""
-        return (self.name, self.versions, self.variants,
-                self.architecture, self.compiler)
+        return (self.name,
+                self.namespace,
+                self.versions,
+                self.variants,
+                self.architecture,
+                self.compiler)
 
 
     def eq_node(self, other):
@@ -1489,11 +1652,15 @@ class Spec(object):
 
 
     def _cmp_key(self):
-        """Comparison key for this node and all dependencies *without*
-           considering structure.  This is the default, as
-           normalization will restore structure.
+        """This returns a key for the spec *including* DAG structure.
+
+        The key is the concatenation of:
+          1. A tuple describing this node in the DAG.
+          2. The hash of each of this node's dependencies' cmp_keys.
         """
-        return self._cmp_node() + (self.sorted_deps(),)
+        return self._cmp_node() + (
+            tuple(hash(self.dependencies[name])
+                  for name in sorted(self.dependencies)),)
 
 
     def colorized(self):
@@ -1505,13 +1672,28 @@ class Spec(object):
            in the format string.  The format strings you can provide are::
 
                $_   Package name
-               $@   Version
-               $%   Compiler
-               $%@  Compiler & compiler version
+               $.   Full package name (with namespace)
+               $@   Version with '@' prefix
+               $%   Compiler with '%' prefix
+               $%@  Compiler with '%' prefix & compiler version with '@' prefix
                $+   Options
-               $=   Architecture
-               $#   7-char prefix of DAG hash
+               $=   Architecture with '=' prefix
+               $#   7-char prefix of DAG hash with '-' prefix
                $$   $
+
+               You can also use full-string versions, which leave off the prefixes:
+
+               ${PACKAGE}       Package name
+               ${VERSION}       Version
+               ${COMPILER}      Full compiler string
+               ${COMPILERNAME}  Compiler name
+               ${COMPILERVER}   Compiler version
+               ${OPTIONS}       Options
+               ${ARCHITECTURE}  Architecture
+               ${SHA1}          Dependencies 8-char sha1 prefix
+
+               ${SPACK_ROOT}    The spack root directory
+               ${SPACK_INSTALL} The default spack install directory, ${SPACK_PREFIX}/opt
 
            Optionally you can provide a width, e.g. $20_ for a 20-wide name.
            Like printf, you can provide '-' for left justification, e.g.
@@ -1528,7 +1710,8 @@ class Spec(object):
         color    = kwargs.get('color', False)
         length = len(format_string)
         out = StringIO()
-        escape = compiler = False
+        named = escape = compiler = False
+        named_str = fmt = ''
 
         def write(s, c):
             if color:
@@ -1552,6 +1735,8 @@ class Spec(object):
 
                 if c == '_':
                     out.write(fmt % self.name)
+                elif c == '.':
+                    out.write(fmt % self.fullname)
                 elif c == '@':
                     if self.versions and self.versions != _any_version:
                         write(fmt % (c + str(self.versions)), c)
@@ -1568,9 +1753,12 @@ class Spec(object):
                 elif c == '#':
                     out.write('-' + fmt % (self.dag_hash(7)))
                 elif c == '$':
-                    if fmt != '':
+                    if fmt != '%s':
                         raise ValueError("Can't use format width with $$.")
                     out.write('$')
+                elif c == '{':
+                    named = True
+                    named_str = ''
                 escape = False
 
             elif compiler:
@@ -1583,6 +1771,43 @@ class Spec(object):
                 else:
                     out.write(c)
                 compiler = False
+
+            elif named:
+                if not c == '}':
+                    if i == length - 1:
+                        raise ValueError("Error: unterminated ${ in format: '%s'"
+                                         % format_string)
+                    named_str += c
+                    continue;
+                if named_str == 'PACKAGE':
+                    write(fmt % self.name, '@')
+                if named_str == 'VERSION':
+                    if self.versions and self.versions != _any_version:
+                        write(fmt % str(self.versions), '@')
+                elif named_str == 'COMPILER':
+                    if self.compiler:
+                        write(fmt % self.compiler, '%')
+                elif named_str == 'COMPILERNAME':
+                    if self.compiler:
+                        write(fmt % self.compiler.name, '%')
+                elif named_str == 'COMPILERVER':
+                    if self.compiler:
+                        write(fmt % self.compiler.versions, '%')
+                elif named_str == 'OPTIONS':
+                    if self.variants:
+                        write(fmt % str(self.variants), '+')
+                elif named_str == 'ARCHITECTURE':
+                    if self.architecture:
+                        write(fmt % str(self.architecture), '=')
+                elif named_str == 'SHA1':
+                    if self.dependencies:
+                        out.write(fmt % str(self.dag_hash(7)))
+                elif named_str == 'SPACK_ROOT':
+                    out.write(fmt % spack.prefix)
+                elif named_str == 'SPACK_INSTALL':
+                    out.write(fmt % spack.install_path)
+
+                named = False
 
             elif c == '$':
                 escape = True
@@ -1700,17 +1925,24 @@ class SpecParser(spack.parse.Parser):
     def spec(self):
         """Parse a spec out of the input.  If a spec is supplied, then initialize
            and return it instead of creating a new one."""
-        self.check_identifier()
+
+        spec_namespace, dot, spec_name = self.token.value.rpartition('.')
+        if not spec_namespace:
+            spec_namespace = None
+
+        self.check_identifier(spec_name)
 
         # This will init the spec without calling __init__.
         spec = Spec.__new__(Spec)
-        spec.name = self.token.value
+        spec.name = spec_name
         spec.versions = VersionList()
         spec.variants = VariantMap(spec)
         spec.architecture = None
         spec.compiler = None
+        spec.external = None
         spec.dependents   = DependencyMap()
         spec.dependencies = DependencyMap()
+        spec.namespace = spec_namespace
 
         spec._normal = False
         spec._concrete = False
@@ -1804,12 +2036,14 @@ class SpecParser(spack.parse.Parser):
         return compiler
 
 
-    def check_identifier(self):
+    def check_identifier(self, id=None):
         """The only identifiers that can contain '.' are versions, but version
            ids are context-sensitive so we have to check on a case-by-case
            basis. Call this if we detect a version id where it shouldn't be.
         """
-        if '.' in self.token.value:
+        if not id:
+            id = self.token.value
+        if '.' in id:
             self.last_token_error("Identifier cannot contain '.'")
 
 
